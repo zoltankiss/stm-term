@@ -61,6 +61,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .mem .hit { font-size: 12px; margin-top: 4px; color: var(--text); opacity: .85; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
 .mem .hit mark { background: color-mix(in srgb, var(--warn) 35%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
 .mem .where { font: 10px ui-monospace, Menlo, monospace; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; margin-right: 6px; }
+.mem .where.ticket { color: var(--claude, var(--warn)); }
 .mem .where.produced { color: var(--warn); border-color: var(--warn); }
 .mem .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .mem .right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }

@@ -240,7 +240,7 @@ function searchProduced(db, q) {
 // Snippet from one chunk, built here rather than with FTS5 snippet(): that needs a MATCH, which
 // re-reads the whole doclist for every result (seconds for a common prefix across 60 results).
 // Picks the ~200-char window with the most distinct query words, words matched as prefixes. It starts
-// ~40 chars before the first hit: the sidebar shows three narrow lines, and the hit must be in them.
+// ~20 chars before the first hit: the sidebar shows three narrow lines, and the hit must be in them.
 function snippet(db, q, rowid, width = 200) {
   const words = WORDS(q);
   if (!words.length || !rowid) return '';
@@ -267,7 +267,7 @@ function snippet(db, q, rowid, width = 200) {
     const score = seen.size * 2 + (hits[i].prose ? 1 : 0);
     if (score > bestScore) { bestScore = score; best = i; }
   }
-  let from = Math.max(0, hits[best].at - 40);
+  let from = Math.max(0, hits[best].at - 20); // the sidebar shows ~3 narrow lines; the hit must be in them
   const space = body.indexOf(' ', from);
   if (from > 0 && space > from && space < hits[best].at) from = space + 1; // start on a word
   const to = Math.min(body.length, from + width);

@@ -44,6 +44,23 @@ fs.writeFileSync(path.join(fixDir, `${SEARCH_A}.jsonl`),
 fs.writeFileSync(path.join(fixDir, `${SEARCH_B}.jsonl`),
   turn(SEARCH_B, 'user', 'can you check https://ledger-round9.example.test/ please')
   + turn(SEARCH_B, 'assistant', [{ type: 'text', text: 'Looked at https://ledger-round9.example.test/ and it loads.' }]));
+// Ranking fixtures: three sessions on ticket proj-4242 (the tag comes from the cwd). Two have "walrus"
+// in their title, one 30 days old; the third never says "walrus" but is the same ticket.
+const WALRUS_OLD = '55555555-2222-4333-8444-555555555555';
+const WALRUS_NEW = '66666666-2222-4333-8444-555555555555';
+const SAME_TICKET = '77777777-2222-4333-8444-555555555555';
+const walrus = (sid, title, ask, ageDays) => {
+  const f = path.join(fixDir, `${sid}.jsonl`);
+  const turn = (role, content) => line({ type: role, entrypoint: 'cli', cwd: '/tmp/proj-4242', sessionId: sid, message: { role, content } });
+  fs.writeFileSync(f, turn('user', ask) + turn('assistant', [{ type: 'text', text: 'On it.' }]) + line({ type: 'ai-title', aiTitle: title, sessionId: sid }));
+  const t = new Date(Date.now() - ageDays * 86_400_000);
+  fs.utimesSync(f, t, t);
+};
+walrus(WALRUS_OLD, 'Walrus ledger export', 'Export the walrus ledger', 30);
+walrus(WALRUS_NEW, 'Walrus totals check', 'Check the walrus totals', 0);
+walrus(SAME_TICKET, 'Gift card refund QA', 'QA the gift card refunds for proj-4242', 0);
+// Interactive sessions the importer should bring in (the SDK one below is skipped).
+const IMPORTS = 7;
 fs.writeFileSync(path.join(fixDir, '99999999-2222-4333-8444-555555555555.jsonl'),
   line({ type: 'user', entrypoint: 'sdk-cli', cwd: '/tmp/observer', message: { role: 'user', content: 'background observer prompt' } }));
 // Default tab directory comes from config.json (the path a Finder-launched app relies on).
@@ -114,7 +131,7 @@ async function main() {
   // 0. Existing Claude Code sessions are imported into long-term memory (interactive only).
   const imported = await until(async () => {
     const m = await api('GET', '/api/memory');
-    return m.items.length >= 4 && m.items.every((x) => x.tag_status === 'done') && m.items;
+    return m.items.length >= IMPORTS && m.items.every((x) => x.tag_status === 'done') && m.items;
   }, REAL ? 60000 : 8000);
   const fx = imported && imported.find((x) => x.agent_session_id === FIX_SID);
   const cx = imported && imported.find((x) => x.agent_session_id === CODEX_SID);
@@ -122,7 +139,7 @@ async function main() {
     cx ? `"${cx.title}" [${cx.tags.join(', ')}]` : 'missing');
   const hooksJson = JSON.parse(fs.readFileSync(path.join(codexHome, 'hooks.json'), 'utf8'));
   check('Codex SessionStart hook installed into hooks.json', JSON.stringify(hooksJson).includes('agent-session-hook.sh'));
-  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === 4 && !!fx && fx.tags.length > 0,
+  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === IMPORTS && !!fx && fx.tags.length > 0,
     imported ? `${imported.length} item(s): "${fx && fx.title}" [${fx && fx.tags.join(', ')}]` : 'timeout');
   check('imported session keeps Claude ai-title', fx && fx.title === 'Foxtrot billing webhook queue migration');
   await page.fill('[data-testid=ltm-search]', 'webhook queue');
@@ -131,7 +148,7 @@ async function main() {
   await page.fill('[data-testid=ltm-search]', '');
 
   // 0b. Conversation search: the whole transcript is indexed, not just the last screen.
-  const idx = await until(async () => { const h = await api('GET', '/api/health'); return h.index && !h.index.scanning && h.index.sessions >= 4 && h.index; }, 15000);
+  const idx = await until(async () => { const h = await api('GET', '/api/health'); return h.index && !h.index.scanning && h.index.sessions >= IMPORTS && h.index; }, 15000);
   check('conversation index covers every imported session', !!idx, idx ? `${idx.sessions} session(s), ${idx.transcriptBytes} bytes` : 'timeout');
   const q = (s) => api('GET', `/api/memory?q=${encodeURIComponent(s)}`);
   const zebra = await q('zebrafish');
@@ -147,6 +164,12 @@ async function main() {
   check('a URL the agent only read (curl) is not "produced"', read.items.some((x) => x.agent_session_id === SEARCH_A) && !read.items.some((x) => x.match.where === 'produced'));
   check('tool output is not indexed', (await q('kangaroo')).items.length === 0);
   check('search results are ranked (no day headings)', r9.ranked === true);
+  const wal = await q('walrus');
+  const at = (sid) => wal.items.findIndex((x) => x.agent_session_id === sid);
+  check('recency: of two equal title matches, the recent one ranks first', at(WALRUS_NEW) >= 0 && at(WALRUS_OLD) > at(WALRUS_NEW), `new #${at(WALRUS_NEW) + 1}, old #${at(WALRUS_OLD) + 1}`);
+  const same = wal.items[at(SAME_TICKET)];
+  check('a session on the same ticket matches though it never says the word', !!same && same.match.where === 'ticket' && same.match.ticket === 'proj-4242', same ? JSON.stringify(same.match).slice(0, 80) : 'missing');
+  check('...and today\'s same-ticket session outranks a 30-day-old title match', at(SAME_TICKET) < at(WALRUS_OLD));
   await page.fill('[data-testid=ltm-search]', 'zebrafish');
   const mark = await until(async () => {
     const items = page.locator('[data-testid=memory-item]');
@@ -220,7 +243,7 @@ async function main() {
 
   // Evict a second tab so tag filtering has something to exclude.
   await page.click('[data-testid=new-shell]');
-  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === 6, REAL ? 90000 : 10000);
+  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === IMPORTS + 2, REAL ? 90000 : 10000);
   const mem2 = await api('GET', '/api/memory');
   const target = mem2.items.find((x) => x.id === ids[2]);
   const others = mem2.items.filter((x) => x.id !== ids[2]);
@@ -233,7 +256,7 @@ async function main() {
   await page.screenshot({ path: path.join(ART, '03-tag-filter.png') });
   await page.click('[data-testid=tag-filter]');
   await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 4, 3000);
-  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 6);
+  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === IMPORTS + 2);
 
   // 5. Click a memory → it comes back to short-term, stalest goes out, live process reattaches.
   const before = await api('GET', '/api/state');
@@ -268,7 +291,7 @@ async function main() {
   }, 8000);
   check('snapshot replayed after restart', !!restoredAfter);
   const memAfter = await api('GET', '/api/memory');
-  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === 7, `${memAfter.items.length} items`);
+  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === IMPORTS + 3, `${memAfter.items.length} items`);
 
   // Forgetting an imported session sticks across rescans/restarts.
   await api('DELETE', `/api/memory/${fx.id}`);

@@ -442,14 +442,24 @@ function forget(id) {
 // just closed is at the top even if it had been idle for an hour.
 const recency = (t) => Math.max(t.last_active_at || 0, t.evicted_at || 0);
 
-// With a query, results come back in match order, best first:
-//   0 the session produced it (a URL, branch or file it introduced), when that is specific: a
-//     word that matches what 30 sessions produced (a repo name in every path) is not a signal
-//   1 the title, tags or summary match
-//   2 the conversation matches: all words close together, then all words anywhere in it
-//     (ranked by how much of the conversation matches)
-//   3 only the last screen matches
+// With a query, results come back best first:
+//   - Something the session produced (a URL, branch or file it introduced) pins it to the top, at any
+//     age, when the query looks like an identifier (a digit, dot or slash: round7, a URL, a path) and
+//     the match is specific (5 or fewer sessions): "which session made this link". For plain words
+//     ("multiple coupons") it only adds to the score; an old file name shouldn't outrank today's work.
+//   - Everything else gets one score: how much matches, times how recently the session was active
+//     (half-life a week, never below 10%). Matching the title or tags adds most, the amount of the
+//     conversation that matches adds the rest, the last screen alone adds little. Recency matters
+//     because you are usually looking for the session you were in, not the one from two months ago.
+//   - A ticket is a feature. When the title/tag matches mostly share a ticket tag (trend-1828), every
+//     session carrying that tag counts as a match ("same ticket"), even if it never names the query:
+//     a session titled "gift card refund QA" is still the coupons feature if it's TREND-1828.
 // Each result says where it matched and shows the matching text.
+const DAY = 86_400_000;
+const TICKET_TAG = /^[a-z]{2,10}-\d{3,6}$/;
+const IDENTIFIER = /[\d./]/;
+const freshness = (t) => 0.1 + 0.9 * 0.5 ** ((now() - recency(t)) / (7 * DAY));
+
 function searchMemory(q, tag) {
   let rows = [...tabs.values()].filter((t) => t.state === 'ltm');
   if (tag) rows = rows.filter((r) => (r.tags || []).includes(tag));
@@ -466,26 +476,36 @@ function searchMemory(q, tag) {
   try { convo = search.searchConversations(sdb, q); made = search.searchProduced(sdb, q); } catch (e) { console.error('[search]', e.message); }
   const SPECIFIC = 5;
   if (made.size > SPECIFIC) made = new Map();
+
+  // Tickets most title/tag matches share: at least two of them, and a quarter of all such matches.
+  const metaRows = rows.filter((t) => meta.has(t.id));
+  const ticketCount = new Map();
+  for (const t of metaRows) for (const g of new Set(t.tags || [])) if (TICKET_TAG.test(g)) ticketCount.set(g, (ticketCount.get(g) || 0) + 1);
+  const topicTickets = new Set([...ticketCount].filter(([, n]) => n >= 2 && n >= metaRows.length * 0.25).map(([g]) => g));
+
   const hits = [];
   for (const t of rows) {
     const sid = t.agent_session_id;
     const c = sid && convo.get(sid);
     const m = sid && made.get(sid);
-    let match = null;
-    if (m) match = { where: 'produced', tier: 0, text: m.join('  ·  ') };
-    else if (meta.has(t.id)) match = { where: 'title', tier: 1 };
-    else if (c) match = { where: 'conversation', tier: c.spread ? 2.5 : 2 };
-    else if (screen.has(t.id)) match = { where: 'screen', tier: 3 };
-    if (!match) continue;
-    hits.push({ t, match, score: c ? c.score : 0, chunks: c ? c.chunks : 0, best: c ? c.best : null });
+    const ticket = (t.tags || []).find((g) => topicTickets.has(g));
+    let where = null;
+    let strength = 0;
+    if (meta.has(t.id)) { where = 'title'; strength += 3; } else if (ticket) { where = 'ticket'; strength += 2; }
+    if (c) { where = where || 'conversation'; strength += Math.log1p(c.chunks) * (c.spread ? 0.6 : 1); }
+    if (!where && screen.has(t.id)) { where = 'screen'; strength += 0.5; }
+    if (m) { where = 'produced'; strength += 4; }
+    if (!where) continue;
+    hits.push({ t, where, pinned: !!m && IDENTIFIER.test(q), made: m, ticket, score: strength * freshness(t), chunks: c ? c.chunks : 0, best: c ? c.best : null });
   }
-  hits.sort((a, b) => a.match.tier - b.match.tier || a.score - b.score || recency(b.t) - recency(a.t));
-  const items = hits.slice(0, 200).map(({ t, match, chunks, best }, i) => {
-    let text = match.text || '';
+  hits.sort((a, b) => (b.pinned - a.pinned) || (a.pinned ? recency(b.t) - recency(a.t) : b.score - a.score));
+  const items = hits.slice(0, 200).map(({ t, where, made: m, ticket, chunks, best }, i) => {
+    let text = m ? m.join('  ·  ') : '';
+    let textFrom = m ? 'produced' : null;
     if (!text && i < 60 && best) {
-      try { text = search.snippet(sdb, q, best); } catch {}
+      try { text = search.snippet(sdb, q, best); textFrom = 'conversation'; } catch {}
     }
-    return { ...publicTab(t), match: { where: match.where, text, chunks } };
+    return { ...publicTab(t), match: { where, text, textFrom, chunks, ticket: where === 'ticket' ? ticket : undefined } };
   });
   return { items, tagCounts, ranked: true };
 }

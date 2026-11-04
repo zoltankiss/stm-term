@@ -162,11 +162,21 @@ async function loadMemory() {
 
 // Matching text from the server marks hits with \u0002…\u0003; escape first, then highlight.
 const highlight = (s) => esc(s).replace(/\u0002/g, '<mark>').replace(/\u0003/g, '</mark>');
-const WHERE = { produced: 'made', title: 'title', conversation: 'said', screen: 'screen' };
+const WHERE = { produced: 'made', title: 'title', ticket: 'same ticket', conversation: 'said', screen: 'screen' };
+const WHY = {
+  produced: 'This session introduced it',
+  title: 'Title, tags or summary match',
+  ticket: 'Shares a ticket with the sessions whose titles match',
+  conversation: 'Matches in the conversation',
+  screen: 'Only its last screen matches',
+};
 function matchLine(m) {
   if (!m) return '';
-  const label = `<span class="where ${m.where}" title="${m.where === 'produced' ? 'This session introduced it' : m.where === 'conversation' ? `Matches in ${m.chunks} part(s) of the conversation` : m.where === 'screen' ? 'Only its last screen matches' : 'Title, tags or summary match'}">${WHERE[m.where]}</span>`;
-  return m.text ? `<div class="hit" data-testid="match">${label}${highlight(m.text)}</div>` : `<div class="hit" data-testid="match">${label}</div>`;
+  const label = (w, extra = '') => `<span class="where ${w}" title="${WHY[w]}${extra}">${WHERE[w]}</span>`;
+  // The label says why it matched; when the text shown is from somewhere else, say that too.
+  let labels = label(m.where, m.where === 'conversation' ? ` (${m.chunks} part(s))` : m.ticket ? ` (${m.ticket})` : '');
+  if (m.textFrom === 'conversation' && m.where !== 'conversation') labels += label('conversation', ` (${m.chunks} part(s))`);
+  return `<div class="hit" data-testid="match">${labels}${m.text ? highlight(m.text) : ''}</div>`;
 }
 
 function renderMemory(items, tagCounts, ranked) {
