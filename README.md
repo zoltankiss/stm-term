@@ -18,13 +18,9 @@ node test/electron.mjs        # the real Electron app, hidden window: autostart 
 node test/claude-tab.mjs      # real Claude tab: task → image drop → evict → tags → close → --resume
 ```
 
-New tabs start in the focused tab's directory. With no tab focused they start in `STM_DEFAULT_CWD`,
-else `"defaultCwd"` in `~/.stm-term/config.json` (`~` is expanded), else your home directory. Use the
-config file if you launch from Finder or the Dock, since those don't pass environment variables:
-
-```bash
-echo '{ "defaultCwd": "~/code/main-repo" }' > ~/.stm-term/config.json   # then restart the daemon
-```
+To change anything about stm-term, ask the agent in any tab: *"make new tabs open in ~/code/main-repo"*,
+*"keep 7 tabs open instead of 5"*. It takes effect immediately. There is no settings screen to look for
+(decision #1 below).
 
 **Images & files:** drag them onto a tab, as in Terminal/iTerm. In the desktop app the real path is pasted,
 backslash-escaped, and as a bracketed paste, so Claude/Codex show `[Image #1]`. `⌘V` with an image on the
@@ -48,6 +44,14 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
 ```
 
 ## Decisions (and why)
+
+- **#1: no dropdowns, no settings screens, no config files to edit. You tell an agent what you want and
+  it does it.** Every setting is changed through the API (`GET`/`PATCH /api/config`, below) by the agent
+  you are already talking to, with the `stm-term` command every tab has on its PATH. Each setting is described
+  in words, changes take effect live, and bad values are refused with a reason, so the agent can work it
+  out without you. A feature that needs a menu, a toggle or a preferences pane gets
+  an API and a sentence in `settable` instead. If you catch yourself writing "click…" or "open the
+  settings…" in docs or in an answer, that is a bug in stm-term.
 
 - **Daemon + web UI, Electron is just a window.** QA runs fully headless in its own Chromium, so it
   never takes your focus. Several QA runs can share the machine (each has its own port and data dir).
@@ -119,6 +123,29 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
   an `x-stm: 1` header on mutations (a cross-site POST can't send it without a CORS preflight, which
   is never approved). The WebSocket checks `Origin`.
 
+## Changing stm-term (for the agent you asked)
+
+Every stm-term tab has a `stm-term` command on its PATH, talking to the daemon that owns the tab:
+
+```bash
+stm-term config                        # every setting: what it does, current value
+stm-term config set defaultCwd ~/code/main-repo     # applied now and saved, no restart
+stm-term config set maxTabs 7
+stm-term config reset maxTabs          # back to the default
+stm-term search round7                 # find a session in long-term memory
+stm-term status
+```
+
+Underneath it is `GET`/`PATCH $STM_API/api/config` (with an `x-stm: 1` header), for anything that
+prefers HTTP. An invalid value is refused with the reason, and nothing is saved. If a setting is pinned
+by an `STM_*` environment variable on the daemon, it says so instead of pretending to apply it. Settings
+live in `~/.stm-term/config.json`, which belongs to the API, so don't edit it. When someone asks for
+something that isn't a setting yet, the change belongs in stm-term itself: add it to `SETTINGS` in
+`src/server.js`, with a sentence saying what it does.
+
+Why a command: asked in plain words to change a setting, a real agent's first move was
+`which stm-term`. It never looked at environment variables.
+
 ## Agent-native QA
 
 Every UI action has an API twin, so an agent can check state as data and use pixels only to check layout:
@@ -128,13 +155,14 @@ Every UI action has an API twin, so an agent can check state as data and use pix
 | `GET /api/state` | short-term tabs, focused id, `nextToEvict` |
 | `GET /api/memory?q=&tag=` | long-term items + tag counts; with `q`, ranked, each with `match: {where, text}` |
 | `GET /api/health` | includes `index`: sessions indexed, bytes read, whether a pass is running |
+| `GET /api/config` · `PATCH /api/config {key: value \| null}` | settings, described; changes apply live |
 | `POST /api/tabs {cwd?, claude?}` | open a tab (may evict) |
 | `GET /api/tabs/:id/text?lines=` | plain-text screen of any tab, live or archived |
 | `POST /api/tabs/:id/input {data}` | type into a tab (does **not** refresh staleness) |
 | `POST /api/tabs/:id/focus` · `/close` | |
 | `POST /api/memory/:id/restore` · `/retag` · `DELETE /api/memory/:id` | |
 
-Mutations need the `x-stm: 1` header. `GET /api/health` reports the default cwd in use.
+Mutations need the `x-stm: 1` header.
 An agent that starts the daemon with `cmd &` from zsh gets `BG_NICE`: the daemon and every tab run at nice +5.
 Start it from bash, or with `setopt no_bg_nice`. For free-form exploring, start an isolated daemon
 (`STM_PORT=4811 STM_DATA_DIR=$(mktemp -d) STM_TAGGER=fake npm run daemon`) and point a headless browser
@@ -142,7 +170,8 @@ Start it from bash, or with `setopt no_bg_nice`. For free-form exploring, start 
 UI hooks use `data-testid`: `stm-tab`, `next-evict`, `new-shell`, `new-claude`, `close-tab`,
 `ltm-search`, `memory-item`, `mem-tag`, `tag-filter`, `forget`.
 
-Env: `STM_PORT` (4790) · `STM_DATA_DIR` (~/.stm-term) · `STM_DEFAULT_CWD` (~) · `STM_MAX` (5) · `STM_TAGGER` (claude|api|fake) ·
+Env, for tests and one-off daemons (an `STM_*` value pins that setting; everyday changes go through
+`/api/config`): `STM_PORT` (4790) · `STM_DATA_DIR` (~/.stm-term) · `STM_DEFAULT_CWD` (~) · `STM_MAX` (5) · `STM_TAGGER` (claude|api|fake) ·
 `STM_CLAUDE_CMD` · `STM_CODEX_BIN` / `STM_CODEX_CMD` · `STM_SHELL`.
 
 **Tagging failures** (e.g. the Claude CLI mid auto-update) are retried with backoff, then retried

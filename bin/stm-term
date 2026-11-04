@@ -1,0 +1,78 @@
+#!/usr/bin/env node
+'use strict';
+// stm-term's command line, for the agent you asked to change something. Every stm-term tab has this
+// on its PATH and talks to the daemon that owns that tab ($STM_API), so `which stm-term` is all an
+// agent needs to find it. There is no settings screen: this is how stm-term gets changed.
+const API = process.env.STM_API || `http://127.0.0.1:${process.env.STM_PORT || 4790}`;
+
+const HELP = `stm-term: a terminal with short-term memory (open tabs) and long-term memory (searchable history).
+There is no settings screen. When the user asks to change stm-term, change it with this command.
+
+  stm-term config                    every setting: what it does, current value
+  stm-term config set KEY VALUE      change a setting now (applied live and saved, no restart)
+  stm-term config reset KEY          back to the default
+  stm-term search WORDS...           find a session in long-term memory
+  stm-term status                    daemon, open tabs, index
+
+Talking to: ${API}${process.env.STM_API ? ' (this tab\'s daemon)' : ' (no $STM_API: not inside a stm-term tab)'}
+If what the user wants is not a setting, it is a change to stm-term itself: ${require('path').resolve(__dirname, '..')}`;
+
+async function call(method, path, body) {
+  let res;
+  try {
+    res = await fetch(API + path, {
+      method, headers: { 'content-type': 'application/json', 'x-stm': '1' }, body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    console.error(`stm-term: no daemon at ${API}. Is stm-term running?`);
+    process.exit(2);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { console.error(`stm-term: ${data.error || res.status}`); process.exit(1); }
+  return data;
+}
+
+function showConfig(c) {
+  for (const [k, describe] of Object.entries(c.settable)) {
+    console.log(`${k} = ${JSON.stringify(c.effective[k])}${k in c.saved ? '' : '   (default)'}`);
+    console.log(`    ${describe}`);
+  }
+  if (c.overriddenByEnv.length) console.log(`\nPinned by the daemon's environment (can't be changed here): ${c.overriddenByEnv.join(', ')}`);
+}
+
+const parseValue = (v) => (/^-?\d+$/.test(v) ? Number(v) : v);
+
+async function main() {
+  const [cmd, sub, key, ...rest] = process.argv.slice(2);
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') return console.log(HELP);
+  if (cmd === 'config' && !sub) return showConfig(await call('GET', '/api/config'));
+  if (cmd === 'config' && sub === 'set' && key && rest.length) {
+    const c = await call('PATCH', '/api/config', { [key]: parseValue(rest.join(' ')) });
+    return console.log(`${key} = ${JSON.stringify(c.effective[key])} (applied now)`);
+  }
+  if (cmd === 'config' && sub === 'reset' && key) {
+    const c = await call('PATCH', '/api/config', { [key]: null });
+    return console.log(`${key} = ${JSON.stringify(c.effective[key])} (default)`);
+  }
+  if (cmd === 'search') {
+    const q = [sub, key, ...rest].filter(Boolean).join(' ');
+    const { items } = await call('GET', `/api/memory?q=${encodeURIComponent(q)}`);
+    for (const t of items.slice(0, 15)) {
+      const m = t.match || {};
+      console.log(`${t.title}  [${m.where || ''}]  session ${t.agent_session_id || '-'}  ${t.cwd || ''}`);
+      if (m.text) console.log(`    ${m.text.replace(/[\u0002\u0003]/g, '').slice(0, 160)}`);
+    }
+    return items.length ? undefined : console.log('nothing in memory matches');
+  }
+  if (cmd === 'status') {
+    const [h, s] = await Promise.all([call('GET', '/api/health'), call('GET', '/api/state')]);
+    console.log(`daemon pid ${h.pid}, data ${h.data}`);
+    console.log(`open tabs ${s.stm.length}/${s.max}; long-term memory ${s.ltmCount}`);
+    for (const t of s.stm) console.log(`  ${t.id === s.focusedId ? '*' : ' '} ${t.title}  (${t.cwd})`);
+    if (h.index) console.log(`index: ${h.index.sessions} sessions${h.index.scanning ? ', scanning' : ''}`);
+    return undefined;
+  }
+  console.error(`stm-term: unknown command. Run "stm-term help".`);
+  process.exit(1);
+}
+main();

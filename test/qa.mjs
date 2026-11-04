@@ -356,6 +356,44 @@ async function main() {
   check('?lines=5 returns the output after clear', !!tail);
   check('shell actually started in the default dir', !!tail && tail.includes(DEFAULT_DIR), tail || '');
 
+  // 10. Decision #1: no settings screen. An agent in a tab finds stm-term from its environment and
+  // changes settings through /api/config, live, with reasons when it gets something wrong.
+  await api('POST', `/api/tabs/${fresh.id}/input`, { data: 'clear; echo "API=$STM_API HOME=$STM_HOME"\r' });
+  const envLine = await until(async () => { const r = await api('GET', `/api/tabs/${fresh.id}/text?lines=5`); return /API=http/.test(r.text) && r.text; }, 8000);
+  check('a tab tells its agent where stm-term is ($STM_API, $STM_HOME)', !!envLine && envLine.includes(`API=${BASE}`) && envLine.includes(`HOME=${ROOT}`), envLine || '');
+  const cfg = await api('GET', '/api/config');
+  check('GET /api/config describes every setting in words', cfg.settable && /directory/i.test(cfg.settable.defaultCwd) && /tabs/i.test(cfg.settable.maxTabs) && cfg.effective.maxTabs === 5,
+    JSON.stringify(cfg.effective));
+  const patch = (body) => fetch(`${BASE}/api/config`, { method: 'PATCH', headers: { 'content-type': 'application/json', 'x-stm': '1' }, body: JSON.stringify(body) })
+    .then(async (r) => ({ status: r.status, body: await r.json() }));
+  const OTHER_DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stm-qa-other-')));
+  const moved = await patch({ defaultCwd: OTHER_DIR });
+  check('PATCH defaultCwd applies at once', moved.status === 200 && moved.body.effective.defaultCwd === OTHER_DIR, `${moved.status}`);
+  await api('POST', `/api/tabs/${fresh.id}/close`);
+  for (const t of (await api('GET', '/api/state')).stm) await api('POST', `/api/tabs/${t.id}/close`);
+  const afterMove = await api('POST', '/api/tabs', {});
+  check('the next new tab opens there, no restart', afterMove.cwd === OTHER_DIR, afterMove.cwd);
+  check('the change is saved to config.json', JSON.parse(fs.readFileSync(path.join(data, 'config.json'), 'utf8')).defaultCwd === OTHER_DIR);
+  const bad = await patch({ defaultCwd: '/no/such/dir', maxTabs: 3 });
+  check('a bad value is refused with the reason, and nothing in that request is applied',
+    bad.status === 400 && /not a directory/.test(bad.body.error) && (await api('GET', '/api/config')).effective.maxTabs === 5, bad.body.error);
+  const unknown = await patch({ theme: 'dark' });
+  check('an unknown setting is refused, naming what can be set', unknown.status === 400 && /maxTabs/.test(unknown.body.error), unknown.body.error);
+  const cfgNoHeader = await fetch(`${BASE}/api/config`, { method: 'PATCH', body: '{"maxTabs":2}' });
+  check('PATCH without the x-stm header is refused', cfgNoHeader.status === 403);
+  for (let i = 0; i < 3; i++) await api('POST', '/api/tabs', {});
+  const shrunk = await patch({ maxTabs: 2 });
+  const st2 = await api('GET', '/api/state');
+  check('lowering maxTabs moves the stalest tabs out now', shrunk.status === 200 && st2.stm.length === 2 && st2.max === 2, `${st2.stm.length} open, max ${st2.max}`);
+  // The way an agent actually goes about it: `which stm-term`, then the command, from inside a tab.
+  const cli = st2.stm[0].id;
+  await api('POST', `/api/tabs/${cli}/input`, { data: 'clear; which stm-term && stm-term config set maxTabs 4 && stm-term config | head -2; echo CLI-$((40+2))\r' });
+  const cliOut = await until(async () => { const r = await api('GET', `/api/tabs/${cli}/text?lines=12`); return r.text.includes("CLI-42") && r.text; }, 15000);
+  check('inside a tab, `which stm-term` finds the command', !!cliOut && cliOut.includes(path.join(ROOT, 'bin', 'stm-term')), cliOut || '');
+  check('`stm-term config set` changes the setting live', !!cliOut && cliOut.includes('maxTabs = 4 (applied now)') && (await api('GET', '/api/state')).max === 4);
+  const reset = await patch({ maxTabs: null, defaultCwd: null });
+  check('null returns a setting to its default', reset.status === 200 && reset.body.effective.maxTabs === 5 && !('maxTabs' in reset.body.saved));
+
   await page.screenshot({ path: path.join(ART, '05-after-restart.png') });
   const all = await api('GET', '/api/memory');
   const keys = all.items.map((x) => Math.max(x.last_active_at || 0, x.evicted_at || 0));

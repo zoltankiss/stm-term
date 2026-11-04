@@ -21,7 +21,6 @@ const search = require('./search');
 
 const PORT = +(process.env.STM_PORT || 4790);
 const DATA = process.env.STM_DATA_DIR || path.join(os.homedir(), '.stm-term');
-const MAX = +(process.env.STM_MAX || 5);
 const SHELL = process.env.STM_SHELL || process.env.SHELL || '/bin/zsh';
 const ROOT = path.join(__dirname, '..');
 const SESSIONS_DIR = path.join(DATA, 'agent-sessions'); // SessionStart hook records, keyed by tab id
@@ -29,21 +28,76 @@ const UPLOADS = path.join(DATA, 'uploads'); // dropped / pasted files, so their 
 const MAX_UPLOAD = 50 * 1024 * 1024;
 const IMPORT_CLAUDE = process.env.STM_IMPORT_CLAUDE !== '0';
 const ACTIVE_WINDOW = 10 * 60 * 1000; // a session touched this recently may be open in another terminal
-// Where a tab starts when there is no focused tab to inherit from: STM_DEFAULT_CWD, else
-// "defaultCwd" in <data dir>/config.json (read at startup, so a Finder-launched app gets it too), else ~.
 const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
-function readDefaultCwd() {
-  let cfg = {};
-  try { cfg = JSON.parse(fs.readFileSync(path.join(DATA, 'config.json'), 'utf8')); } catch {}
-  const want = expandHome(process.env.STM_DEFAULT_CWD || cfg.defaultCwd);
-  if (want && fs.existsSync(want)) return want;
-  if (want) console.warn(`stm-term: default cwd ${want} does not exist; using ~`);
-  return os.homedir();
+
+// ---------- config ----------
+// No settings screen and no dropdowns (README, decision #1). You tell an agent what you want and it
+// calls this API: GET /api/config says what can be changed and what each setting does, PATCH changes
+// it live, with no restart. Saved to <data dir>/config.json. An STM_* environment variable still wins
+// (tests and one-off daemons use them), and the API says so rather than pretending to apply.
+const CONFIG_FILE = path.join(DATA, 'config.json');
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const SETTINGS = {
+  defaultCwd: {
+    env: 'STM_DEFAULT_CWD',
+    describe: 'Directory a new tab starts in when there is no focused tab to inherit from. "~" is expanded.',
+    fallback: () => os.homedir(),
+    check(v) { const p = expandHome(String(v)); if (!isDir(p)) throw new Error(`${p} is not a directory`); return String(v); },
+    resolve(v) { const p = expandHome(String(v)); return isDir(p) ? p : null; },
+  },
+  maxTabs: {
+    env: 'STM_MAX',
+    describe: 'Short-term memory: how many tabs stay open before the stalest moves to long-term memory (1-20). Lowering it moves the stalest tabs out now; their processes keep running.',
+    fallback: () => 5,
+    check(v) { const n = Number(v); if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('maxTabs must be a whole number from 1 to 20'); return n; },
+    resolve(v) { const n = Number(v); return Number.isInteger(n) && n >= 1 ? n : null; },
+  },
+};
+let config = {};
+try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch {}
+function setting(key) {
+  const s = SETTINGS[key];
+  const fromEnv = process.env[s.env];
+  if (fromEnv) { const v = s.resolve(fromEnv); if (v !== null) return v; }
+  if (config[key] !== undefined) {
+    const v = s.resolve(config[key]);
+    if (v !== null) return v;
+  }
+  return s.fallback();
+}
+const DEFAULT_CWD = () => setting('defaultCwd');
+const MAX = () => setting('maxTabs');
+function describeConfig() {
+  return {
+    file: CONFIG_FILE,
+    saved: config,
+    effective: Object.fromEntries(Object.keys(SETTINGS).map((k) => [k, setting(k)])),
+    settable: Object.fromEntries(Object.entries(SETTINGS).map(([k, s]) => [k, s.describe])),
+    overriddenByEnv: Object.entries(SETTINGS).filter(([, s]) => process.env[s.env]).map(([k, s]) => `${k} (${s.env})`),
+  };
+}
+/** PATCH { key: value } sets a setting; { key: null } returns it to the default. All or nothing. */
+function updateConfig(body) {
+  const next = { ...config };
+  for (const [k, v] of Object.entries(body || {})) {
+    const s = SETTINGS[k];
+    if (!s) throw Object.assign(new Error(`unknown setting "${k}"; settable: ${Object.keys(SETTINGS).join(', ')}`), { status: 400 });
+    if (process.env[s.env]) throw Object.assign(new Error(`${k} is set by ${s.env} in the daemon's environment, which wins; unset it and restart`), { status: 409 });
+    if (v === null) delete next[k];
+    else try { next[k] = s.check(v); } catch (e) { throw Object.assign(e, { status: 400 }); }
+  }
+  const tmp = `${CONFIG_FILE}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`);
+  fs.renameSync(tmp, CONFIG_FILE);
+  config = next;
+  const focused = stmTabs().sort((a, b) => b.last_focused_at - a.last_focused_at)[0];
+  enforceLimit(focused ? focused.id : null); // a lower maxTabs takes effect now
+  broadcastState();
+  return describeConfig();
 }
 
 fs.mkdirSync(DATA, { recursive: true });
 const db = openDb(path.join(DATA, 'stm.sqlite'));
-const DEFAULT_CWD = readDefaultCwd();
 // Conversation index (see src/search.js). Opened here first so the schema exists before the worker
 // starts; the worker writes, this connection only reads.
 const SEARCH_FILE = path.join(DATA, 'search.sqlite');
@@ -98,10 +152,10 @@ function snapshotState() {
   const stm = stmTabs();
   const byFocus = [...stm].sort((a, b) => a.last_focused_at - b.last_focused_at);
   return {
-    max: MAX,
+    max: MAX(),
     stm: stm.map(publicTab),
     focusedId: byFocus.length ? byFocus[byFocus.length - 1].id : null,
-    nextToEvict: stm.length >= MAX ? byFocus[0].id : null,
+    nextToEvict: stm.length >= MAX() ? byFocus[0].id : null,
     ltmCount: [...tabs.values()].filter((t) => t.state === 'ltm').length,
     memVersion,
   };
@@ -127,6 +181,12 @@ function childEnv(id) {
   const env = cleanEnv({ TERM_PROGRAM: 'stm-term', COLORTERM: 'truecolor' });
   for (const k of Object.keys(env)) if (k.startsWith('STM_')) delete env[k];
   env.STM_TAB_ID = id;
+  // So an agent in a tab can find stm-term and change it when asked (README, "Changing stm-term").
+  // Agents look for a command first (`which stm-term`); an environment variable alone went unnoticed
+  // when a real agent was asked to change a setting.
+  env.STM_API = `http://127.0.0.1:${PORT}`;
+  env.STM_HOME = ROOT;
+  env.PATH = `${path.join(ROOT, 'bin')}:${env.PATH || ''}`;
   env.STM_SESSIONS_DIR = SESSIONS_DIR;
   return env;
 }
@@ -145,7 +205,7 @@ function plainText(term, lines = 400) {
 function spawnLive(t, { replay = false, command = null } = {}) {
   const cols = t.cols || 120;
   const rows = t.rows || 32;
-  const cwd = t.cwd && fs.existsSync(t.cwd) ? t.cwd : DEFAULT_CWD;
+  const cwd = t.cwd && fs.existsSync(t.cwd) ? t.cwd : DEFAULT_CWD();
   const term = new Terminal({ cols, rows, scrollback: 5000, allowProposedApi: true });
   const ser = new SerializeAddon();
   term.loadAddon(ser);
@@ -282,7 +342,7 @@ function createTab({ cwd, agent = null, claude = false, command = null } = {}) {
   if (agent && !agents[agent]) throw new Error(`unknown agent ${agent}`);
   const id = crypto.randomUUID();
   const t = {
-    id, title: '', osc_title: '', cwd: cwd || DEFAULT_CWD, state: 'stm', kind: agent || 'shell',
+    id, title: '', osc_title: '', cwd: cwd || DEFAULT_CWD(), state: 'stm', kind: agent || 'shell',
     position: nextPosition(), created_at: now(), last_focused_at: now(), last_active_at: now(),
     tags: [], summary: '', tag_status: 'none', agent_session_id: null, command,
   };
@@ -308,7 +368,7 @@ function focus(id) {
 function enforceLimit(protectId) {
   const stm = stmTabs().filter((t) => t.id !== protectId).sort((a, b) => a.last_focused_at - b.last_focused_at);
   const evicted = [];
-  while (stm.length + (protectId ? 1 : 0) > MAX) {
+  while (stm.length + (protectId ? 1 : 0) > MAX()) {
     const t = stm.shift();
     archive(t, { kill: false });
     evicted.push(t.id);
@@ -539,8 +599,12 @@ const server = http.createServer(async (req, res) => {
   const body = req.method === 'GET' ? {} : await readBody(req);
   let m;
   try {
-    if (p === '/api/health') return json(res, 200, { ok: true, pid: process.pid, data: DATA, max: MAX, defaultCwd: DEFAULT_CWD, index: indexState });
+    if (p === '/api/health') return json(res, 200, { ok: true, pid: process.pid, data: DATA, max: MAX(), defaultCwd: DEFAULT_CWD(), index: indexState });
     if (p === '/api/state') return json(res, 200, snapshotState());
+    if (p === '/api/config' && req.method === 'GET') return json(res, 200, describeConfig());
+    if (p === '/api/config' && req.method === 'PATCH') {
+      try { return json(res, 200, updateConfig(body)); } catch (e) { return json(res, e.status || 500, { error: e.message }); }
+    }
     if (p === '/api/memory' && req.method === 'GET') return json(res, 200, searchMemory(url.searchParams.get('q'), url.searchParams.get('tag')));
     if (p === '/api/tabs' && req.method === 'POST') return json(res, 200, publicTab(createTab(body)));
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)$/)) && req.method === 'GET') {
@@ -624,7 +688,7 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`stm-term daemon on http://127.0.0.1:${PORT}  data=${DATA}  max=${MAX}  cwd=${DEFAULT_CWD}`);
+  console.log(`stm-term daemon on http://127.0.0.1:${PORT}  data=${DATA}  max=${MAX()}  cwd=${DEFAULT_CWD()}`);
   // Tabs that were open when the daemon last stopped come back as snapshots with fresh shells.
   for (const t of stmTabs()) if (!live.has(t.id)) spawnLive(t, { replay: true, command: resumeCommand(t) });
   // Drop tags we no longer emit (e.g. claude-code) from older rows.
