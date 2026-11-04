@@ -6,7 +6,7 @@ const { DatabaseSync } = require('node:sqlite');
 const COLS = [
   'id', 'title', 'osc_title', 'cwd', 'state', 'kind', 'position', 'created_at', 'last_focused_at',
   'last_active_at', 'evicted_at', 'tags', 'summary', 'tag_status', 'claude_session_id', 'command',
-  'snapshot', 'scrollback', 'cols', 'rows', 'import_source', 'agent_session_id',
+  'snapshot', 'scrollback', 'cols', 'rows', 'import_source', 'agent_session_id', 'requester',
 ];
 
 function openDb(file) {
@@ -19,7 +19,7 @@ function openDb(file) {
       created_at INTEGER, last_focused_at INTEGER, last_active_at INTEGER, evicted_at INTEGER,
       tags TEXT DEFAULT '[]', summary TEXT DEFAULT '', tag_status TEXT DEFAULT 'none',
       claude_session_id TEXT, command TEXT, snapshot TEXT, scrollback TEXT DEFAULT '',
-      cols INTEGER, rows INTEGER, import_source TEXT, agent_session_id TEXT
+      cols INTEGER, rows INTEGER, import_source TEXT, agent_session_id TEXT, requester TEXT
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS tabs_fts USING fts5(id UNINDEXED, title, tags, summary, cwd, scrollback);
   `);
@@ -27,6 +27,8 @@ function openDb(file) {
   // Migrations for databases created by earlier versions.
   const have = new Set(db.prepare('PRAGMA table_info(tabs)').all().map((c) => c.name));
   if (!have.has('import_source')) db.exec('ALTER TABLE tabs ADD COLUMN import_source TEXT');
+  // NULL = never looked at by a tagger that asks who requested the work; '' = looked, nobody else.
+  if (!have.has('requester')) db.exec('ALTER TABLE tabs ADD COLUMN requester TEXT');
   if (!have.has('agent_session_id')) {
     // Was Claude-only (claude_session_id); now any agent.
     db.exec('ALTER TABLE tabs ADD COLUMN agent_session_id TEXT');
@@ -52,7 +54,7 @@ function openDb(file) {
         return v === undefined ? null : v;
       }));
       delFts.run(t.id);
-      insFts.run(t.id, `${t.title || ''} ${t.osc_title || ''}`, (t.tags || []).join(' '), t.summary || '',
+      insFts.run(t.id, `${t.title || ''} ${t.osc_title || ''} ${t.requester || ''}`, (t.tags || []).join(' '), t.summary || '',
         t.cwd || '', t.scrollback || '');
     },
     remove(id) {

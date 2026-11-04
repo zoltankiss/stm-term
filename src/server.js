@@ -89,7 +89,7 @@ function publicTab(t) {
     id: t.id, title: displayTitle(t), osc_title: t.osc_title, ai_title: t.title, cwd: t.cwd, state: t.state,
     kind: t.kind, position: t.position, created_at: t.created_at, last_focused_at: t.last_focused_at,
     last_active_at: t.last_active_at, evicted_at: t.evicted_at, tags: t.tags || [], summary: t.summary,
-    tag_status: t.tag_status, agent_session_id: t.agent_session_id, import_source: t.import_source || null,
+    tag_status: t.tag_status, agent_session_id: t.agent_session_id, requester: t.requester || '', import_source: t.import_source || null,
     process: L ? (L.exited ? 'exited' : 'running') : 'snapshot',
     active_elsewhere: !L && !!t.import_source && now() - (t.last_active_at || 0) < ACTIVE_WINDOW,
   };
@@ -329,6 +329,9 @@ function archive(t, { kill }) {
   tagTab(t, kill ? null : L);
 }
 
+const IMAGE_FIRST = /FIRST ASK: \[Image #\d+\]/;
+const imageFirst = (t, info) => IMAGE_FIRST.test(t.scrollback || '') || IMAGE_FIRST.test((info && info.agent && info.agent.transcript) || '');
+
 async function tagTab(t, L) {
   try {
     const pid = L && !L.exited ? L.pty.pid : null;
@@ -340,8 +343,13 @@ async function tagTab(t, L) {
       agent: info.agent, scrollback: t.scrollback, previousTags: t.tags,
       produced: t.agent_session_id ? search.producedOf(sdb, t.agent_session_id) : [],
     });
-    const keepTitle = t.import_source && t.osc_title; // the agent's own session title beats ours
-    Object.assign(t, { title: keepTitle ? t.osc_title : (out.title || t.title), tags: out.tags, summary: out.summary, tag_status: 'done' });
+    // The agent's own session title beats ours, except when its first ask was only a screenshot:
+    // that title was written without seeing the image ("Image attachment"), ours read the reply to it.
+    const keepTitle = t.import_source && t.osc_title && !imageFirst(t, info);
+    Object.assign(t, {
+      title: keepTitle ? t.osc_title : (out.title || t.title), tags: out.tags, summary: out.summary,
+      requester: out.requester || '', tag_status: 'done',
+    });
   } catch (e) {
     t.tag_status = 'error';
     t.summary = t.summary || `tagging failed: ${String(e.message || e).slice(0, 120)}`;
@@ -631,6 +639,9 @@ server.listen(PORT, '127.0.0.1', () => {
   for (const t of tabs.values()) if ((t.tags || []).some((g) => tagger.NOISE.has(g))) { t.tags = t.tags.filter((g) => !tagger.NOISE.has(g)); save(t); }
   // Tagging interrupted by a previous shutdown resumes now.
   for (const t of tabs.values()) if (t.state === 'ltm' && ['queued', 'pending', 'error'].includes(t.tag_status)) queueTag(t);
+  // Sessions that began with only a screenshot were titled without seeing it, and never asked who
+  // requested them (requester NULL). Re-tag those once; everything else keeps its tags.
+  for (const t of tabs.values()) if (t.state === 'ltm' && t.requester == null && IMAGE_FIRST.test(t.scrollback || '')) queueTag(t);
   if (process.env.STM_INSTALL_CODEX_HOOK !== '0') {
     try { console.log(`[codex] SessionStart hook: ${agents.codex.ensureHook()}`); } catch (e) { console.error('[codex] hook install failed', e.message); }
   }

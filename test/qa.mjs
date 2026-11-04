@@ -44,6 +44,14 @@ fs.writeFileSync(path.join(fixDir, `${SEARCH_A}.jsonl`),
 fs.writeFileSync(path.join(fixDir, `${SEARCH_B}.jsonl`),
   turn(SEARCH_B, 'user', 'can you check https://ledger-round9.example.test/ please')
   + turn(SEARCH_B, 'assistant', [{ type: 'text', text: 'Looked at https://ledger-round9.example.test/ and it loads.' }]));
+// A session that began with only a screenshot of a colleague's message. Claude's own title for it was
+// written blind ("Image attachment"); the first reply says who asked and what about.
+const SHOT_SID = '44444444-2222-4333-8444-555555555555';
+const shotTurn = (role, content) => line({ type: role, entrypoint: 'cli', cwd: '/tmp/parcel-desk', sessionId: SHOT_SID, message: { role, content } });
+fs.writeFileSync(path.join(fixDir, `${SHOT_SID}.jsonl`),
+  shotTurn('user', [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } }, { type: 'text', text: '[Image #1]' }])
+  + shotTurn('assistant', [{ type: 'text', text: 'Maryn (care team) reports that order 99-0000001 went out from the warehouse instead of the store.' }])
+  + line({ type: 'ai-title', aiTitle: 'Image attachment', sessionId: SHOT_SID }));
 fs.writeFileSync(path.join(fixDir, '99999999-2222-4333-8444-555555555555.jsonl'),
   line({ type: 'user', entrypoint: 'sdk-cli', cwd: '/tmp/observer', message: { role: 'user', content: 'background observer prompt' } }));
 // Default tab directory comes from config.json (the path a Finder-launched app relies on).
@@ -114,7 +122,7 @@ async function main() {
   // 0. Existing Claude Code sessions are imported into long-term memory (interactive only).
   const imported = await until(async () => {
     const m = await api('GET', '/api/memory');
-    return m.items.length >= 4 && m.items.every((x) => x.tag_status === 'done') && m.items;
+    return m.items.length >= 5 && m.items.every((x) => x.tag_status === 'done') && m.items;
   }, REAL ? 60000 : 8000);
   const fx = imported && imported.find((x) => x.agent_session_id === FIX_SID);
   const cx = imported && imported.find((x) => x.agent_session_id === CODEX_SID);
@@ -122,16 +130,23 @@ async function main() {
     cx ? `"${cx.title}" [${cx.tags.join(', ')}]` : 'missing');
   const hooksJson = JSON.parse(fs.readFileSync(path.join(codexHome, 'hooks.json'), 'utf8'));
   check('Codex SessionStart hook installed into hooks.json', JSON.stringify(hooksJson).includes('agent-session-hook.sh'));
-  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === 4 && !!fx && fx.tags.length > 0,
+  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === 5 && !!fx && fx.tags.length > 0,
     imported ? `${imported.length} item(s): "${fx && fx.title}" [${fx && fx.tags.join(', ')}]` : 'timeout');
   check('imported session keeps Claude ai-title', fx && fx.title === 'Foxtrot billing webhook queue migration');
+  const shot = imported && imported.find((x) => x.agent_session_id === SHOT_SID);
+  check('a screenshot-first session records who asked', !!shot && shot.requester === 'Maryn (care team)', shot ? `"${shot.requester}"` : 'missing');
+  check('a screenshot-first session is not titled "Image attachment"', !!shot && shot.title !== 'Image attachment', shot && shot.title);
+  check('searching the requester finds the session', (await api('GET', '/api/memory?q=maryn')).items.some((x) => x.agent_session_id === SHOT_SID));
+  const shown = page.locator(`[data-testid=memory-item][data-id="${shot && shot.id}"] [data-testid=requester]`);
+  await until(async () => (await shown.count()) === 1, 3000);
+  check('the sidebar shows "from Maryn (care team)"', (await shown.count()) === 1 && (await shown.innerText()) === 'from Maryn (care team)');
   await page.fill('[data-testid=ltm-search]', 'webhook queue');
   await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 1, 3000);
   check('search finds imported session by transcript text', await page.locator(`[data-testid=memory-item][data-id="${fx && fx.id}"]`).count() === 1);
   await page.fill('[data-testid=ltm-search]', '');
 
   // 0b. Conversation search: the whole transcript is indexed, not just the last screen.
-  const idx = await until(async () => { const h = await api('GET', '/api/health'); return h.index && !h.index.scanning && h.index.sessions >= 4 && h.index; }, 15000);
+  const idx = await until(async () => { const h = await api('GET', '/api/health'); return h.index && !h.index.scanning && h.index.sessions >= 5 && h.index; }, 15000);
   check('conversation index covers every imported session', !!idx, idx ? `${idx.sessions} session(s), ${idx.transcriptBytes} bytes` : 'timeout');
   const q = (s) => api('GET', `/api/memory?q=${encodeURIComponent(s)}`);
   const zebra = await q('zebrafish');
@@ -220,7 +235,7 @@ async function main() {
 
   // Evict a second tab so tag filtering has something to exclude.
   await page.click('[data-testid=new-shell]');
-  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === 6, REAL ? 90000 : 10000);
+  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === 7, REAL ? 90000 : 10000);
   const mem2 = await api('GET', '/api/memory');
   const target = mem2.items.find((x) => x.id === ids[2]);
   const others = mem2.items.filter((x) => x.id !== ids[2]);
@@ -233,7 +248,7 @@ async function main() {
   await page.screenshot({ path: path.join(ART, '03-tag-filter.png') });
   await page.click('[data-testid=tag-filter]');
   await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 4, 3000);
-  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 6);
+  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 7);
 
   // 5. Click a memory → it comes back to short-term, stalest goes out, live process reattaches.
   const before = await api('GET', '/api/state');
@@ -268,7 +283,7 @@ async function main() {
   }, 8000);
   check('snapshot replayed after restart', !!restoredAfter);
   const memAfter = await api('GET', '/api/memory');
-  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === 7, `${memAfter.items.length} items`);
+  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === 8, `${memAfter.items.length} items`);
 
   // Forgetting an imported session sticks across rescans/restarts.
   await api('DELETE', `/api/memory/${fx.id}`);

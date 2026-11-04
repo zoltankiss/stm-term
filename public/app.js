@@ -195,6 +195,7 @@ function renderMemory(items, tagCounts, ranked) {
         <div class="icon">${icon(t.kind)}</div>
         <div>
           <div class="t">${esc(t.title)}</div>
+          ${t.requester ? `<div class="from" data-testid="requester">from ${esc(t.requester)}</div>` : ''}
           ${t.summary ? `<div class="s">${esc(t.summary)}</div>` : ''}
           ${matchLine(t.match)}
           <div class="p">${esc(home(t.cwd))}</div>

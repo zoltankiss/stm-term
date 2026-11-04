@@ -39,6 +39,9 @@ function headTail(file, headBytes = 200_000, tailBytes = 400_000) {
 // "FIRST ASK" + recent turns, within a character budget: what tells you why an agent tab mattered.
 function excerptFrom(headMsgs, tailMsgs, budget = 6000) {
   const first = headMsgs.find((m) => m.role === 'user');
+  // The agent's first answer says what the first ask was about. When the ask was only a screenshot,
+  // that answer is the one place in the text that does ("Maryn reports order 44-… shipped …").
+  const reply = first ? headMsgs.slice(headMsgs.indexOf(first) + 1).find((m) => m.role !== 'user') : null;
   const recent = [];
   let used = 0;
   for (let i = tailMsgs.length - 1; i >= 0 && used < budget * 0.7; i--) {
@@ -46,7 +49,8 @@ function excerptFrom(headMsgs, tailMsgs, budget = 6000) {
     recent.unshift(t);
     used += t.length;
   }
-  return [first ? `FIRST ASK: ${first.text.slice(0, budget * 0.3)}` : '', 'RECENT:', ...recent].join('\n');
+  return [first ? `FIRST ASK: ${first.text.slice(0, budget * 0.3)}` : '', reply ? `FIRST REPLY: ${reply.text.slice(0, 1500)}` : '',
+    'RECENT:', ...recent].filter(Boolean).join('\n');
 }
 
 module.exports = { TEMP_CWD, isHuman, runs, walk, headTail, excerptFrom };
